@@ -34,35 +34,21 @@ def _timeout_handler(signum, frame):
     raise SimulationTimeoutError("物理模拟超时")
 
 def simulate_with_timeout(shot, timeout=3):
-    """带超时保护的物理模拟
+    """带超时保护的物理模拟 (Windows 兼容版 - 无超时)
     
     参数：
         shot: pt.System 对象
-        timeout: 超时时间（秒），默认3秒
+        timeout: 忽略
     
     返回：
-        bool: True 表示模拟成功，False 表示超时或失败
-    
-    说明：
-        使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
-        超时后自动恢复，不会导致程序卡死
+        bool: True 表示模拟成功
     """
-    # 设置超时信号处理器
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout)  # 设置超时时间
-    
     try:
         pt.simulate(shot, inplace=True)
-        signal.alarm(0)  # 取消超时
         return True
-    except SimulationTimeoutError:
-        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
-        return False
     except Exception as e:
-        signal.alarm(0)  # 取消超时
-        raise e
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+        print(f"[WARNING] 物理模拟出错: {e}")
+        return False
 
 # ============================================
 
@@ -380,18 +366,324 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """基于启发式搜索的智能 Agent"""
     
     def __init__(self):
-        pass
-    
-    def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
+        super().__init__()
+        self.enable_noise = False
+        self.noise_std = {
+            'V0': 0.1, 'phi': 0.1, 'theta': 0.1, 'a': 0.003, 'b': 0.003
+        }
         
-        参数：
-            observation: (balls, my_targets, table)
+    def _calculate_cut_angle(self, cue_pos, target_pos, pocket_pos, ball_radius):
+        """计算切球角度
         
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
+        参数:
+            cue_pos: 白球位置 [x, y, z]
+            target_pos: 目标球位置 [x, y, z]
+            pocket_pos: 袋口位置 [x, y, z]
+            ball_radius: 球半径
+            
+        返回:
+            phi: 击球角度 (度)
+            cut_angle: 切球角度 (度, 0=直球, 90=极薄)
+            distance: 白球到幽灵球的距离
         """
-        return self._random_action()
+        # 转换为 numpy 数组 (忽略 z 轴)
+        cue = np.array(cue_pos[:2])
+        target = np.array(target_pos[:2])
+        pocket = np.array(pocket_pos[:2])
+        
+        # 1. 计算目标球到袋口的向量
+        target_to_pocket = pocket - target
+        dist_target_pocket = np.linalg.norm(target_to_pocket)
+        if dist_target_pocket < 1e-5:
+            return 0, 0, 0 # 已经在袋口
+            
+        # 单位向量
+        u_target_pocket = target_to_pocket / dist_target_pocket
+        
+        # 2. 计算幽灵球位置 (Ghost Ball)
+        # 幽灵球位于目标球沿 (pocket-target) 反方向 2R 处
+        ghost_pos = target - u_target_pocket * (2 * ball_radius)
+        
+        # 3. 计算白球到幽灵球的向量 (这是击球方向)
+        cue_to_ghost = ghost_pos - cue
+        dist_cue_ghost = np.linalg.norm(cue_to_ghost)
+        
+        if dist_cue_ghost < 1e-5:
+            phi = 0
+        else:
+            # 计算角度 phi (相对于 x 轴)
+            phi_rad = np.arctan2(cue_to_ghost[1], cue_to_ghost[0])
+            phi = np.degrees(phi_rad) % 360
+            
+        # 4. 计算切球角度 (Cut Angle)
+        # 即 cue_to_ghost 和 target_to_pocket 之间的夹角
+        # cos(theta) = (u_cue_ghost . u_target_pocket)
+        if dist_cue_ghost > 1e-5:
+            u_cue_ghost = cue_to_ghost / dist_cue_ghost
+            cos_theta = np.dot(u_cue_ghost, u_target_pocket)
+            # 限制范围 [-1, 1]
+            cos_theta = np.clip(cos_theta, -1.0, 1.0)
+            cut_angle = np.degrees(np.arccos(cos_theta))
+        else:
+            cut_angle = 0
+            
+        return phi, cut_angle, dist_cue_ghost
+
+    def _is_path_clear(self, start_pos, end_pos, balls, ignore_ids, ball_radius):
+        """检查路径是否被阻挡 (简单的圆柱体检测)"""
+        start = np.array(start_pos[:2])
+        end = np.array(end_pos[:2])
+        path_vec = end - start
+        path_len = np.linalg.norm(path_vec)
+        if path_len < 1e-5:
+            return True
+            
+        u_path = path_vec / path_len
+        
+        # 检查所有球
+        for bid, ball in balls.items():
+            if bid in ignore_ids or ball.state.s == 4: # 忽略自己和已进袋的球
+                continue
+                
+            pos = np.array(ball.state.rvw[0][:2])
+            
+            # 计算球心到路径线段的距离
+            # 投影长度
+            proj = np.dot(pos - start, u_path)
+            
+            # 如果投影在路径范围内
+            if 0 < proj < path_len:
+                # 垂直距离
+                closest_point = start + u_path * proj
+                dist = np.linalg.norm(pos - closest_point)
+                
+                # 如果距离小于 2R (两个球的半径和)，则认为阻挡
+                if dist < 2 * ball_radius * 0.95: # 0.95 是容差
+                    return False
+        
+        return True
+
+    def _find_best_safety_shot(self, balls, my_targets, table, cue_pos, ball_radius):
+        """寻找最佳防守/解球方案 (Kick Shot)
+        目标：合法击中自己的球，并尽量让白球停在难打的位置
+        """
+        safety_candidates = []
+        
+        remaining_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
+        if not remaining_targets:
+            remaining_targets = ['8']
+
+        # 1. 尝试直接击打 (虽然不能进球，但至少不犯规)
+        for tid in remaining_targets:
+            target_pos = balls[tid].state.rvw[0]
+            # 计算方向
+            vec = np.array(target_pos[:2]) - np.array(cue_pos[:2])
+            dist = np.linalg.norm(vec)
+            if dist < 1e-5: continue
+            
+            phi_rad = np.arctan2(vec[1], vec[0])
+            phi = np.degrees(phi_rad) % 360
+            
+            # 检查路径是否被阻挡 (如果是被阻挡才需要解球，但这里也可以作为保底)
+            # 如果直接路径通畅，就轻推
+            if self._is_path_clear(cue_pos, target_pos, balls, [tid, 'cue'], ball_radius):
+                 # 力度控制：刚好碰到球并弹开一点
+                 # 粗略估算：滚动摩擦减速。
+                 # 假设我们要打到球，速度不需要太大。
+                 v_safety = 1.0 + dist * 0.5 
+                 safety_candidates.append({'phi': phi, 'V0': v_safety, 'type': 'direct_safety'})
+
+        # 2. 尝试单库解球 (Kick Shot)
+        # 简化模型：寻找库边镜像点
+        # 针对每个目标球，计算其关于四个库边的镜像
+        # 库边位置 (Pooltool 默认): x: [0, w], y: [0, l]
+        # table.w, table.l
+        table_w = table.w
+        table_l = table.l
+        
+        cushions = [
+            {'name': 'right', 'mirror_axis': 'x', 'val': table_w},
+            {'name': 'left', 'mirror_axis': 'x', 'val': 0},
+            {'name': 'top', 'mirror_axis': 'y', 'val': table_l},
+            {'name': 'bottom', 'mirror_axis': 'y', 'val': 0},
+        ]
+
+        for tid in remaining_targets:
+            t_pos = balls[tid].state.rvw[0]
+            
+            for cush in cushions:
+                # 计算镜像点
+                mirror_pos = list(t_pos)
+                if cush['mirror_axis'] == 'x':
+                    mirror_pos[0] = 2 * cush['val'] - t_pos[0]
+                else:
+                    mirror_pos[1] = 2 * cush['val'] - t_pos[1]
+                
+                # 计算白球到镜像点的方向
+                vec = np.array(mirror_pos[:2]) - np.array(cue_pos[:2])
+                dist_mirror = np.linalg.norm(vec)
+                phi_rad = np.arctan2(vec[1], vec[0])
+                phi = np.degrees(phi_rad) % 360
+                
+                # 简单的路径检查 (检查白球到库边撞击点)
+                # 撞击点计算
+                # 白球射线: cue_pos + t * vec
+                # 求与库边的交点
+                # 这比较麻烦，做个简化：只要白球周围没球挡着就行
+                # 或者直接加入候选，让模拟器去验证
+                
+                v_kick = 2.5 + dist_mirror * 0.8 # 解球通常需要大一点力
+                safety_candidates.append({'phi': phi, 'V0': v_kick, 'type': 'kick_shot'})
+        
+        return safety_candidates
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        """决策逻辑"""
+        if balls is None or table is None:
+            return self._random_action()
+            
+        # 获取白球
+        cue_ball = balls.get('cue')
+        if not cue_ball:
+            return self._random_action()
+            
+        ball_radius = cue_ball.params.R
+        cue_pos = cue_ball.state.rvw[0]
+        
+        # 确定实际目标球列表
+        remaining_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
+        if not remaining_targets:
+            remaining_targets = ['8'] # 清台后打黑8
+            
+        best_shot = None
+        best_score = -float('inf')
+        
+        # 候选击球方案列表
+        candidates = []
+        
+        # 1. 进攻策略：寻找直接进球机会
+        for target_id in remaining_targets:
+            target_ball = balls[target_id]
+            target_pos = target_ball.state.rvw[0]
+            
+            for pocket_id, pocket in table.pockets.items():
+                pocket_pos = pocket.center
+                
+                # 计算几何参数
+                phi, cut_angle, dist_cue_ghost = self._calculate_cut_angle(
+                    cue_pos, target_pos, pocket_pos, ball_radius
+                )
+                
+                # 过滤高难度球
+                if cut_angle > 80: # 角度太大，很难打
+                    continue
+                    
+                # 路径检查
+                # 1. 目标球到袋口
+                if not self._is_path_clear(target_pos, pocket_pos, balls, [target_id, 'cue'], ball_radius):
+                    continue
+                
+                # 2. 重新精确计算 ghost_pos 用于路径检测
+                target_vec = np.array(target_pos[:2])
+                pocket_vec = np.array(pocket_pos[:2])
+                tp_vec = pocket_vec - target_vec
+                tp_dir = tp_vec / np.linalg.norm(tp_vec)
+                ghost_vec = target_vec - tp_dir * (2 * ball_radius)
+                
+                # 检查白球路径
+                if not self._is_path_clear(cue_pos, list(ghost_vec) + [0], balls, [target_id, 'cue'], ball_radius):
+                    continue
+                    
+                # 这是一个候选方案
+                # 估算力度: 距离越远需要力度越大，切角越大需要力度越大
+                # 基础力度 2.0 m/s
+                base_v = 1.5 + dist_cue_ghost * 1.5 + (cut_angle / 90) * 2.0
+                base_v = min(base_v, 6.0)
+                
+                candidates.append({
+                    'phi': phi,
+                    'V0': base_v,
+                    'target_id': target_id,
+                    'heuristic_score': 100 - cut_angle - dist_cue_ghost * 10, # 基础分 100，优先进攻
+                    'type': 'attack'
+                })
+        
+        # 2. 防守/解球策略：如果没有好的进攻机会，或者为了保底，加入解球候选
+        # 获取解球候选
+        safety_shots = self._find_best_safety_shot(balls, my_targets, table, cue_pos, ball_radius)
+        # 给解球方案较低的分数，确保只有在没进攻机会时才选
+        for s in safety_shots:
+            s['heuristic_score'] = -50 # 负分，作为备选
+            candidates.append(s)
+
+        # 按启发式分数排序，取前N个进行模拟验证
+        # 增加候选数量，包含防守策略
+        candidates.sort(key=lambda x: x['heuristic_score'], reverse=True)
+        top_candidates = candidates[:10] # 增加到前10个
+        
+        # 如果依然没有候选 (极端情况)，随机打几个
+        if not top_candidates:
+             for i in range(5):
+                 top_candidates.append({
+                     'phi': random.uniform(0, 360), 
+                     'V0': random.uniform(1.0, 5.0),
+                     'type': 'random'
+                 })
+        
+        # 3. 模拟验证选出最佳方案
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        
+        for cand in top_candidates:
+            # 针对不同类型调整微调策略
+            if cand.get('type') == 'attack':
+                test_V0s = [cand['V0'], cand['V0']*0.8, cand['V0']*1.2]
+            elif cand.get('type') == 'kick_shot':
+                test_V0s = [cand['V0'], cand['V0']*0.9, cand['V0']*1.1] # 解球对力度敏感
+            else:
+                test_V0s = [cand['V0']]
+            
+            for v in test_V0s:
+                v = np.clip(v, 0.5, 8.0)
+                phi = cand['phi']
+                
+                # 构建 shot
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                cue.set_state(V0=v, phi=phi, theta=0, a=0, b=0)
+                
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                if simulate_with_timeout(shot):
+                    score = analyze_shot_for_reward(shot, last_state_snapshot, my_targets)
+                    
+                    # --- 增强评分逻辑 (Agent 内部优化) ---
+                    # 1. 如果没有犯规且没有进球 (防守成功)，给予额外奖励
+                    # 原有 score 对于无进球无犯规只有 10 分
+                    # 我们希望优先选择不犯规的
+                    
+                    # 2. 简单的白球位置惩罚 (避免贴库)
+                    # 获取模拟后的白球位置
+                    sim_cue = shot.balls['cue']
+                    if sim_cue.state.s != 4: # 白球未进袋
+                        cx, cy = sim_cue.state.rvw[0][:2]
+                        # 检查是否贴库 (假设库边区域为 0.1m)
+                        margin = 0.1
+                        if cx < margin or cx > table.w - margin or cy < margin or cy > table.l - margin:
+                            score -= 5 # 贴库惩罚
+                            
+                    if score > best_score:
+                        best_score = score
+                        best_shot = {
+                            'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0
+                        }
+                        
+        if best_shot:
+            print(f"[NewAgent] 选择方案: score={best_score}, phi={best_shot['phi']:.1f}")
+            return best_shot
+        else:
+            print("[NewAgent] 无可行方案，随机击球")
+            return self._random_action()
