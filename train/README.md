@@ -1,100 +1,51 @@
-# 训练指南
+# AI3603-Billiards 训练环境
 
-本目录包含了用于优化 Agent 参数的训练脚本。
+本目录 (`train/`) 包含了用于训练 `NewAgent` 神经网络模型的脚本和工具。
 
-## 目录结构
+## 1. 训练核心思想
 
-*   `train.py`: 用于优化 `NewAgent` (基于启发式) 的权重参数。
-*   `train_mcts.py`: 用于优化 `MCTSAgent` (基于蒙特卡洛树搜索) 的超参数。
+本项目采用 **模仿学习 (Imitation Learning)** 与 **辅助价值评估** 的策略。
 
-## 环境配置
+*   **教师模型 (Teacher)**: `BasicAgentPro` (MCTS Agent)。它计算量大、决策慢，但基于大量模拟，决策质量极高。
+*   **学生模型 (Student)**: `NewAgent`。它需要决策快，因此我们训练一个神经网络来“直觉”地判断局面的好坏。
+*   **价值网络 (Value Network)**: 一个 MLP (多层感知机) 神经网络，输入当前台面球的状态（位置、归属），输出当前玩家的预期胜率。
 
-确保你已经安装了以下依赖：
-*   `pooltool`
-*   `numpy`
-*   `bayesian-optimization`
-*   `scikit-learn`
+## 2. 训练流程
 
-如果尚未安装，请在项目根目录下运行：
-```bash
-# Ubuntu / Linux / macOS
-conda activate poolenv
-pip install bayesian-optimization scikit-learn numpy
+运行 `train.py` 将执行以下步骤：
 
-# Windows
-.\.venv\Scripts\activate
-pip install bayesian-optimization scikit-learn numpy
-```
+1.  **数据收集 (Self-Play / Versus)**:
+    *   让 `NewAgent` (带有当前模型) 与 `BasicAgentPro` (MCTS 强手) 进行多局对战（默认 50 局）。
+    *   记录每一杆击球前的 **局面状态 (State)** 以及最终的 **比赛胜负 (Winner)**。
+    *   如果是 `NewAgent` 赢了，则它经历的所有局面被标记为高价值 (+1)；输了则标记为低价值 (-1)。
 
----
+2.  **神经网络训练**:
+    *   使用收集到的 `(State, Value)` 数据对 `BilliardValueNet` 进行监督学习训练。
+    *   优化目标是最小化预测价值与实际胜负结果之间的均方误差 (MSE)。
 
-## 1. 优化 NewAgent (train.py)
+3.  **模型更新**:
+    *   训练完成后，模型保存为 `../eval/billiard_value_net.pth`。
+    *   `NewAgent` 在下一轮测试或训练中会自动加载这个新模型，利用更准确的局面评估来辅助决策。
 
-我们使用 **贝叶斯优化** 来自动搜索 `NewAgent` 的最佳启发式权重。优化目标是 Agent 在 N 局对战中对阵 `BasicAgent` 的平均胜率。
+## 3. 目录文件
 
-### 待优化参数
+*   **`train.py`**: 主训练脚本。包含数据收集循环、模型定义、训练循环。
+*   *(注意：训练依赖 `eval/` 目录下的环境代码，脚本会自动处理路径引用)*
 
-| 参数名              | 含义                                                  | 搜索范围      | 默认值 |
-| ------------------- | ----------------------------------------------------- | ------------- | ------ |
-| `w_cut_angle`       | 切球角度的惩罚权重                                    | [0.5, 5.0]    | 1.5    |
-| `w_distance`        | 白球到目标距离的惩罚权重                              | [5.0, 20.0]   | 10.0   |
-| `w_safety_penalty`  | 防守/解球方案的基础负分（越低越倾向于只在绝境时防守） | [10.0, 100.0] | 30.0   |
-| `w_cushion_penalty` | 白球停在贴库位置的惩罚分数                            | [0.0, 20.0]   | 5.0    |
-| `w_position`        | 走位权重：惩罚下一杆目标球距离                        | [0.0, 10.0]   | 5.0    |
-| `w_safety_quality`  | 防守质量权重：奖励防守后白球远离对手球                | [0.0, 5.0]    | 2.0    |
-| `w_lookahead`       | 前瞻权重：奖励能创造下一杆好机会的击球                | [0.0, 5.0]    | 2.0    |
+## 4. 如何运行训练
 
-### 运行训练
-
-在项目根目录下运行：
-```bash
-python train/train.py
-```
-
-### 应用结果
-
-脚本运行结束后，会输出最佳参数组合。请将这些值更新到 `agent.py` 中 `NewAgent` 类的 `__init__` 方法里：
-
-```python
-# agent.py
-class NewAgent(Agent):
-    def __init__(self, weights=None):
-        # ...
-        self.weights = {
-            'w_cut_angle': 1.12,       # 替换为训练结果
-            'w_distance': 12.45,       # 替换为训练结果
-            'w_safety_penalty': 45.67, # 替换为训练结果
-            'w_cushion_penalty': 5.23, # 替换为训练结果
-            'w_position': 3.5,         # 替换为训练结果
-            'w_safety_quality': 1.8,   # 替换为训练结果
-            'w_lookahead': 2.5         # 替换为训练结果
-        }
-        # ...
-```
-
----
-
-## 2. 优化 MCTSAgent (train_mcts.py)
-
-如果你启用了 `MCTSAgent`，可以使用此脚本优化其核心参数（如 UCB 探索常数）。
-
-### 待优化参数
-
-| 参数名   | 含义                                        | 搜索范围   |
-| -------- | ------------------------------------------- | ---------- |
-| `c_puct` | UCB 公式中的探索常数 (控制探索与利用的平衡) | [0.5, 5.0] |
-
-### 运行训练
+在 `train` 目录下运行：
 
 ```bash
-python train/train_mcts.py
+python train.py
 ```
 
-### 应用结果
+**参数调整 (在 `train.py` 中修改):**
 
-将得到的最佳 `c_puct` 值更新到 `mcts_agent.py` 或在实例化 `MCTSAgent` 时传入：
+*   `collect_data(n_games=50)`: 设置数据收集的对战局数。局数越多，数据越丰富，训练效果越好，但耗时越长。
+*   `epochs=10`: 神经网络训练的轮数。
 
-```python
-# mcts_agent.py 或调用处
-agent = MCTSAgent(c_puct=2.5)  # 替换为训练结果
-```
+## 5. 硬件建议
+
+*   由于 `BasicAgentPro` 使用 MCTS 进行大量物理模拟，数据收集阶段对 CPU 计算能力要求较高。
+*   神经网络训练阶段计算量较小，普通 CPU 即可胜任，有 GPU 加速更佳（脚本会自动检测 CUDA）。

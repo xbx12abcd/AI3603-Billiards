@@ -26,7 +26,7 @@ env = PoolEnv()
 env.enable_noise = False # 禁用噪声以避免死循环 (如果agent不具备鲁棒性)
 env.MAX_HIT_COUNT = 20 # 减少最大击球数，加快测试速度
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
 ## 选择对打的对手
 # agent_a, agent_b = BasicAgent(), NewAgent() # 与 BasicAgent 对打
@@ -67,13 +67,33 @@ for i in range(n_games):
             if step_info.get('ENEMY_INTO_POCKET'):
                 print(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         if done:
-            # 统计结果（player A/B 转换为 agent A/B） 
+            # 统计结果
+            # i % 2 == 0 时: Player A 是 agent_a, Player B 是 agent_b
+            # i % 2 == 1 时: Player A 是 agent_b, Player B 是 agent_a
+            
+            # 我们需要知道 agent_a 和 agent_b 谁赢了
+            
+            winner_is_agent_a = False
+            
+            if info['winner'] == 'A':
+                # 如果胜者是 Player A
+                if i % 2 == 0: 
+                    winner_is_agent_a = True # 本局 Player A 是 agent_a
+                else:
+                    winner_is_agent_a = False # 本局 Player A 是 agent_b
+            elif info['winner'] == 'B':
+                 # 如果胜者是 Player B
+                if i % 2 == 0:
+                    winner_is_agent_a = False # 本局 Player B 是 agent_b
+                else:
+                    winner_is_agent_a = True # 本局 Player B 是 agent_a
+            
             if info['winner'] == 'SAME':
                 results['SAME'] += 1
-            elif info['winner'] == 'A':
-                results[['AGENT_A_WIN', 'AGENT_B_WIN'][i % 2]] += 1
+            elif winner_is_agent_a:
+                results['AGENT_A_WIN'] += 1
             else:
-                results[['AGENT_A_WIN', 'AGENT_B_WIN'][(i+1) % 2]] += 1
+                results['AGENT_B_WIN'] += 1
             break
 
 # 计算分数：胜1分，负0分，平局0.5

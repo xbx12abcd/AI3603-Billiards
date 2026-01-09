@@ -30,7 +30,12 @@ class NewAgent(Agent):
         # 尝试加载默认路径
         if model_path is None:
              # 假设模型在 eval 目录下，或者当前工作目录
-             potential_paths = ["billiard_value_net.pth", "eval/billiard_value_net.pth", "../billiard_value_net.pth"]
+             potential_paths = [
+                 "billiard_value_net.pth", 
+                 "eval/billiard_value_net.pth", 
+                 "../billiard_value_net.pth",
+                 "../eval/billiard_value_net.pth"
+             ]
              for p in potential_paths:
                  if os.path.exists(p):
                      model_path = p
@@ -115,6 +120,37 @@ class NewAgent(Agent):
             cut_angle = 0
             
         return phi, cut_angle, dist_cue_ghost
+
+    def _get_opponent_targets(self, balls, my_targets):
+        """推断对手的目标球"""
+        # 1. 确定我的花色
+        my_suit = None
+        if '8' in my_targets and len(my_targets) == 1:
+            my_suit = '8' # 已清台
+        elif any(int(bid) <= 7 for bid in my_targets if bid != '8'):
+            my_suit = 'solid'
+        elif any(int(bid) >= 9 for bid in my_targets if bid != '8'):
+            my_suit = 'stripe'
+            
+        # 2. 推断对手目标
+        opp_targets = []
+        on_table_ids = [bid for bid in balls if balls[bid].state.s != 4 and bid != 'cue' and bid != '8']
+        
+        if my_suit == 'solid':
+            # 对手是 stripe (9-15)
+            opp_targets = [bid for bid in on_table_ids if 9 <= int(bid) <= 15]
+        elif my_suit == 'stripe':
+            # 对手是 solid (1-7)
+            opp_targets = [bid for bid in on_table_ids if 1 <= int(bid) <= 7]
+        else: # my_suit == '8'
+            # 我清台了，对手可能是 solid 也可能是 stripe
+            # 简化：对手目标是所有剩下的非8球
+            opp_targets = on_table_ids
+            
+        if not opp_targets:
+            opp_targets = ['8']
+            
+        return opp_targets
 
     def _is_path_clear(self, start_pos, end_pos, balls, ignore_ids, ball_radius):
         """检查路径是否被阻挡 (简单的圆柱体检测)"""

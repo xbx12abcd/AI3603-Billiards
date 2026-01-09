@@ -1,121 +1,140 @@
 """
-train.py - 启发式权重优化脚本
+train.py - 训练价值网络
 
-功能：
-- 使用贝叶斯优化 (Bayesian Optimization) 自动调整 NewAgent 的启发式权重
-- 通过与 BasicAgent 对战来评估每一组参数的性能
-- 输出最佳参数组合
-
-使用方法：
-    python train.py
+流程：
+1. 数据收集 (Data Collection): 
+   - 让 Agent (NewAgent) 自我对弈。
+   - 记录 (State, Winner) 对。
+2. 训练 (Training):
+   - 使用收集的数据训练 BilliardValueNet。
 """
 
-import sys
 import os
-# 添加父目录到 path 以便导入 agent 和 poolenv
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+# 将 ../eval 加入 path 以导入 poolenv 和 agents
+sys.path.append(os.path.join(os.path.dirname(__file__), '../eval'))
 
-import numpy as np
-from bayes_opt import BayesianOptimization
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from poolenv import PoolEnv
-from agent import BasicAgent, NewAgent
+from agents.new_agent import NewAgent
+from agents.basic_agent_pro import BasicAgentPro
+from agents.network import BilliardValueNet, state_to_tensor
+import random
+import numpy as np
 
-# 设置评估局数 (为了速度，每组参数只打 10 局，正式训练可增加)
-N_EVAL_GAMES = 10
-
-def evaluate_params(w_cut_angle, w_distance, w_safety_penalty, w_cushion_penalty, w_position, w_safety_quality, w_lookahead):
-    """
-    评估函数：输入一组权重，返回 NewAgent 的平均得分或胜率
-    """
-    weights = {
-        'w_cut_angle': w_cut_angle,
-        'w_distance': w_distance,
-        'w_safety_penalty': w_safety_penalty,
-        'w_cushion_penalty': w_cushion_penalty,
-        'w_position': w_position,
-        'w_safety_quality': w_safety_quality,
-        'w_lookahead': w_lookahead
-    }
-    
+def collect_data(n_games=50):
+    """收集对战数据"""
     env = PoolEnv()
-    agent_opponent = BasicAgent()
-    agent_learner = NewAgent(weights=weights)
+    env.enable_noise = False
+    env.MAX_HIT_COUNT = 20
     
-    # NewAgent 始终作为 Agent B (方便统计)
-    players = [agent_opponent, agent_learner]
-    target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']
+    # 使用 NewAgent 与 BasicAgentPro 对战
+    # agent_a: NewAgent (Learner)
+    # agent_b: BasicAgentPro (Teacher/Opponent)
+    agent_a = NewAgent()
+    agent_b = BasicAgentPro() 
     
-    total_score = 0
-    wins = 0
+    data_buffer = [] # [(state_tensor, winner)]
     
-    for i in range(N_EVAL_GAMES):
-        env.reset(target_ball=target_ball_choice[i % 4])
+    print(f"Starting data collection for {n_games} games...")
+    
+    for i in range(n_games):
+        if (i+1) % 5 == 0:
+            print(f"Collecting Game {i+1}/{n_games}...")
+            
+        env.reset(target_ball=['solid', 'stripe'][i%2])
+        
+        episode_states = [] # [(state_tensor, player_id)]
+        
         while True:
             player = env.get_curr_player()
             obs = env.get_observation(player)
+            balls, my_targets, table = obs
             
+            # 记录当前状态
+            state_tensor = state_to_tensor(balls, my_targets, table.w, table.l)
+            episode_states.append((state_tensor, player))
+            
+            # 决策
             if player == 'A':
-                action = players[i % 2].decision(*obs)
+                action = agent_a.decision(*obs)
             else:
-                action = players[(i + 1) % 2].decision(*obs)
+                action = agent_b.decision(*obs)
                 
             env.take_shot(action)
             done, info = env.get_done()
             
             if done:
-                # 统计 NewAgent (Agent B) 的胜负
-                # 注意：evaluate.py 中有复杂的轮换逻辑，这里简化处理
-                # 我们只关心 learner 是否获胜
+                winner = info['winner'] # 'A', 'B', 'SAME'
                 
-                # 确定本局 learner 是 A 还是 B
-                # i=0: A=Opponent, B=Learner (Learner is B)
-                # i=1: A=Learner, B=Opponent (Learner is A)
-                
-                learner_role = 'B' if i % 2 == 0 else 'A'
-                winner = info['winner']
-                
-                if winner == learner_role:
-                    wins += 1
-                    total_score += 1.0
-                elif winner == 'SAME':
-                    total_score += 0.5
-                
+                # 回溯标记价值
+                # 如果 Winner 是 A，则 A 的状态价值为 1，B 的状态价值为 -1
+                for s_tensor, p_id in episode_states:
+                    target_val = 0.0
+                    if winner == 'SAME':
+                        target_val = 0.0
+                    elif winner == p_id:
+                        target_val = 1.0
+                    else:
+                        target_val = -1.0
+                    
+                    data_buffer.append((s_tensor, torch.tensor([target_val])))
                 break
                 
-    # 返回胜率作为优化目标
-    return total_score / N_EVAL_GAMES
+    return data_buffer
 
-def run_optimization():
-    # 定义搜索空间
-    pbounds = {
-        'w_cut_angle': (0.5, 5.0),       # 切球角度惩罚权重
-        'w_distance': (5.0, 20.0),       # 距离惩罚权重
-        'w_safety_penalty': (10.0, 100.0), # 防守方案的基础负分
-        'w_cushion_penalty': (0.0, 20.0),  # 贴库惩罚权重
-        'w_position': (0.0, 10.0),         # 走位权重
-        'w_safety_quality': (0.0, 5.0),    # 防守质量权重
-        'w_lookahead': (0.0, 5.0)          # 前瞻权重
-    }
+def train_model(data, model, epochs=5):
+    """训练模型"""
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
     
-    optimizer = BayesianOptimization(
-        f=evaluate_params,
-        pbounds=pbounds,
-        random_state=42,
-        verbose=2
-    )
+    print(f"Training on {len(data)} samples...")
+    model.train()
     
-    print("开始训练 (贝叶斯优化)...")
-    print(f"每轮评估局数: {N_EVAL_GAMES}")
-    
-    # 初始探索 5 次，优化 10 次
-    optimizer.maximize(
-        init_points=5,
-        n_iter=10
-    )
-    
-    print("\n训练结束！")
-    print("最佳参数组合:")
-    print(optimizer.max)
+    for epoch in range(epochs):
+        total_loss = 0
+        random.shuffle(data)
+        
+        # Mini-batch training (Batch size 32)
+        batch_size = 32
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i+batch_size]
+            inputs = torch.stack([item[0] for item in batch])
+            targets = torch.stack([item[1] for item in batch])
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        print(f"Epoch {epoch+1}, Loss: {total_loss / (len(data)/batch_size):.4f}")
 
 if __name__ == "__main__":
-    run_optimization()
+    # 1. 初始化模型
+    # 模型文件位于 ../eval/billiard_value_net.pth
+    model_path = os.path.join(os.path.dirname(__file__), "../eval/billiard_value_net.pth")
+    model = BilliardValueNet(input_dim=61, hidden_dim=128)
+    
+    if os.path.exists(model_path):
+        try:
+            model.load_state_dict(torch.load(model_path))
+            print(f"Loaded existing model from {model_path}")
+        except:
+            print("Failed to load existing model, starting from scratch.")
+    
+    # 2. 收集数据
+    print("Step 1: Collecting Data...")
+    training_data = collect_data(n_games=50) 
+    
+    # 3. 训练
+    print("Step 2: Training...")
+    train_model(training_data, model, epochs=10)
+    
+    # 4. 保存
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
