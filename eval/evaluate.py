@@ -15,27 +15,23 @@ evaluate.py - Agent 评估脚本
 # 导入必要的模块
 from utils import set_random_seed
 from poolenv import PoolEnv
-from agent import BasicAgent, NewAgent
-try:
-    from mcts_agent import MCTSAgent
-except ImportError:
-    MCTSAgent = None
+from agents import BasicAgent, BasicAgentPro, NewAgent
+from agents.mcts_agent import MCTSAgent
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
 set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
+env.enable_noise = False # 禁用噪声以避免死循环 (如果agent不具备鲁棒性)
+env.MAX_HIT_COUNT = 20 # 减少最大击球数，加快测试速度
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 100  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-# 如果 MCTSAgent 可用，使用它作为 Agent B
-# if MCTSAgent:
-#     print("MCTSAgent 已启用。")
-#     agent_a, agent_b = BasicAgent(), MCTSAgent()
-# else:
-print("MCTSAgent 未找到或已禁用，使用 NewAgent。")
-agent_a, agent_b = BasicAgent(), NewAgent()
+## 选择对打的对手
+# agent_a, agent_b = BasicAgent(), NewAgent() # 与 BasicAgent 对打
+agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
+#agent_a, agent_b = MCTSAgent(), NewAgent() # MCTSAgent 与 NewAgent 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
